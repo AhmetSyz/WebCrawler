@@ -26,7 +26,7 @@ To ensure system stability, the system implements back-pressure via bounded queu
 5. **Back-pressure:** Prevent uncontrolled memory/CPU growth through queue bounds and rate throttling.
 6. **Search output contract:** The searcher returns triples:
    - `(relevant_url, origin_url, depth)`
-7. **Real-time dashboard:** Provide a UI and/or endpoints to monitor indexing progress, queue depth, and throttling.
+7. **Real-time dashboard & control:** Provide a UI and endpoints to **start** crawling, monitor progress, and run searches.
 8. **Resumability (bonus):** Provide a checkpointing strategy to continue after a crash or manual stop.
 
 ### 2.2 Non-Goals (for Phase 1)
@@ -45,7 +45,7 @@ To ensure system stability, the system implements back-pressure via bounded queu
 3. **End user** (via dashboard/search API): enters queries and views crawling progress.
 
 ### 3.2 User Stories
-1. As a user, I can start crawling from an origin URL with a configured maximum depth `k`.
+1. As a user, I can start crawling from an origin URL with a configured maximum depth `k` and `max_urls` URL limit.
 2. As a user, I can perform search queries immediately; results reflect pages already indexed.
 3. As an evaluator, I can view a dashboard that shows crawl progress (fetched/indexed counts), queue depth, and throttling status.
 4. As an operator (bonus), I can stop and restart the crawler and resume from the last checkpoint.
@@ -81,26 +81,28 @@ To ensure system stability, the system implements back-pressure via bounded queu
    - Spawns worker pools for fetching and link extraction.
 2. **Fetcher Workers**
    - `net/http` client fetches pages with timeouts and size limits.
-   - Produces `FetchedPage` objects to the indexing pipeline.
+   - Produces pages to the indexing pipeline.
 3. **Link Extractor**
    - Parses HTML using Go-native HTML tokenization / parsing.
-   - Extracts candidate URLs from anchors (`href`), optionally others (e.g., canonical links).
+   - Extracts candidate URLs from anchors (`href`), optionally others.
    - Normalizes URLs and emits new crawl jobs (if depth permits).
 4. **Indexer**
    - Updates an in-memory inverted index concurrently with crawling.
    - Stores document metadata for search result triple generation.
+   - **Memory management:** periodically flushes index segments to disk and clears in-memory postings to keep RAM bounded.
 5. **Search Service**
    - Serves user queries (HTTP endpoint and/or internal API).
-   - Reads the live index concurrently (read/write concurrency safe).
-   - Returns ranked (or unordered) triples: `(relevant_url, origin_url, depth)`.
-6. **Metrics Reporter**
+   - Reads the live in-memory index concurrently.
+   - If/when in-memory index has been cleared, it may fall back to disk segments (append-only) for token lookup.
+   - Returns ranked triples: `(relevant_url, origin_url, depth)`.
+6. **Metrics Reporter / Control Plane**
    - Aggregates real-time metrics about:
-     - queue depth
-     - pages fetched
-     - pages indexed
-     - active workers/in-flight requests
-     - throttle status
-   - Feeds the dashboard via HTTP endpoints or SSE.
+     - pages crawled
+     - last URL
+     - max URL limit
+     - recent URLs
+     - elapsed time
+   - Feeds the dashboard via HTTP endpoints.
 7. **Persistence Manager (Bonus)**
    - Provides checkpointing of:
      - visited set
@@ -111,8 +113,6 @@ To ensure system stability, the system implements back-pressure via bounded queu
 ### 5.2 Concurrency Model
 The system is composed of goroutine worker pools connected by bounded channels:
 - `frontierJobs chan CrawlJob` (bounded)
-- `fetchedPages chan FetchedPage` (bounded; optional)
-- `indexTasks chan IndexTask` (bounded; optional)
 
 Shared state must be concurrency-safe:
 - Visited set: `sync.Map` or mutex-protected set
@@ -135,15 +135,17 @@ type CrawlJob struct {
 ### 6.2 Fetched Page
 ```go
 type FetchedPage struct {
-  URL        string
-  OriginURL  string
-  Depth      int
-  Body       []byte // bounded by max page size
-  FinalURL   string // after redirects, if tracked
-  StatusCode int
+  URL         string
+  OriginURL   string
+  Depth       int
+  Body        []byte // bounded by max page size
+  FinalURL    string // after redirects, if tracked
+  StatusCode  int
   ContentType string
 }
 ```
+
+**Memory rule:** The crawler must not retain full HTML bodies after link extraction + tokenization. The body buffer must be eligible for GC as soon as the page has been processed.
 
 ### 6.3 Document Metadata
 ```go
@@ -174,6 +176,11 @@ To support concurrent indexing and searching efficiently:
 - Shard the index by hashing token strings into `N` shards.
 - Each shard has its own `RWMutex`.
 
+**Disk segment format (Phase 1 memory optimization):**
+- The system may flush index entries to `storage/<firstLetter>.data` (append-only).
+- Each line stores one posting record:
+  - `token,url,origin_url,depth,count`
+
 ### 6.5 Document Store
 ```go
 type DocumentStore struct {
@@ -203,14 +210,15 @@ The system must accept configuration parameters:
 4. `frontier_queue_capacity` (bounded)
 5. `fetch_timeout_ms` (request timeout)
 6. `max_page_bytes` (limit fetched body size)
-7. Allowed schemes (default: `http` + `https`)
-8. URL normalization settings:
+7. `max_urls` (strict upper bound on number of crawled pages)
+8. Allowed schemes (default: `http` + `https`)
+9. URL normalization settings:
    - remove fragments
    - canonicalize host casing
    - resolve relative links
-9. Optional:
+10. Optional:
    - max redirects
-   - per-host request rate limit
+   - per-host request rate limit / delay
    - same-origin policy or host allowlist/denylist
 
 ### 7.2 Recursive Crawling to Depth `k`
@@ -223,28 +231,40 @@ The system must accept configuration parameters:
 4. The visited set must prevent duplicate enqueue/fetch cycles:
    - If a URL has already been marked visited, it is not enqueued again.
 
-### 7.3 Live Indexing (Concurrent Search Availability)
+### 7.3 Strict Crawl Limiting (`max_urls`)
+1. The crawler must enforce a strict upper bound `max_urls`.
+2. Once the system reaches the limit, it must initiate cancellation and stop scheduling/fetching new work.
+3. Acceptance criteria:
+   - The crawler stops without deadlocking.
+   - The dashboard reports the final count and transitions to idle.
+
+### 7.4 Live Indexing (Concurrent Search Availability)
 1. As soon as a fetched page is parsed into tokens, the indexer updates the inverted index.
 2. Search queries served during crawling read from the live index.
 3. The system must ensure that:
    - Index updates do not corrupt index memory (data race free).
    - Search readers see either the old or the new index state, but never partially corrupted state.
 
-### 7.4 Back-Pressure and Throttling
+### 7.5 Memory Management Requirements (Phase 1)
+1. **Bounded page retention:** HTML bodies must not be stored beyond link extraction and tokenization.
+2. **Streaming tokenization:** HTML-to-text extraction should avoid large intermediate strings where possible.
+3. **Index memory cap by flushing:** the inverted index must support periodic flushing to disk (append-only segments) and clearing in-memory postings to release RAM.
+4. **GC friendliness:** long-lived references to large buffers/strings should be avoided; periodic GC is permitted as an operational safeguard.
+
+### 7.6 Back-Pressure and Throttling
 The system must implement at least one explicit back-pressure mechanism and ideally two:
 1. **Bounded queues:** Use bounded channels for frontier and (optionally) fetch/index stages.
    - If the frontier is full, job producers must block or apply throttling.
-2. **Rate limiting:** Implement per-host throttling using Go-native mechanisms (e.g., token bucket implemented with channels/time.Ticker).
-   - Maintain a throttle status per host: allowed rate, blocked/rate-limited count.
+2. **Rate limiting / delay:** Implement an explicit inter-request delay (global or per-host) using Go-native mechanisms.
 3. **Concurrency limits:** Limit worker pool sizes to cap in-flight requests.
 
 Acceptance criteria:
-- Memory usage must remain bounded under load (queue capacities).
+- Memory usage must remain bounded under load (queue capacities + periodic index flushing).
 - System must not deadlock under normal operation.
 
-### 7.5 Search Output Contract
+### 7.7 Search Output Contract
 When the user queries the search engine:
-1. The search service identifies matching documents using the inverted index.
+1. The search service identifies matching documents using the inverted index (and disk segments if enabled).
 2. It returns a list of triples:
    - `relevant_url` (document URL)
    - `origin_url` (origin associated with that document)
@@ -253,26 +273,22 @@ When the user queries the search engine:
    - Phase 1 may use simple ranking such as sum of term counts or number of matched tokens.
    - The PRD must define ordering deterministically (e.g., highest score first, then stable tie-breaker such as URL lexicographic order).
 
-### 7.6 Dashboard and Monitoring
+### 7.8 Dashboard and Monitoring
 The system must expose dashboard data in real time:
-1. **Queue depth:** current `frontierJobs` length (and/or a computed metric)
-2. **Indexing progress:**
-   - fetched count
-   - indexed count
-   - failed fetch count (optional)
-3. **Throttling status:**
-   - per-host rate limiter utilization
-   - blocked enqueue rate (optional)
-4. **System health:**
-   - active worker count
-   - last checkpoint time (if persistence enabled)
+1. **Progress:** pages crawled, max URLs, percent complete.
+2. **Operational:** running/idle, elapsed time, last crawled URL, recent URLs.
+3. Optional metrics:
+   - queue depth
+   - failed fetch count
+   - throttling status
 
 Mechanism:
 - Provide HTTP endpoints:
-  - `GET /status` returns a JSON snapshot
-  - `GET /events` streams metrics (Server-Sent Events) to update the UI live
+  - `POST /api/crawl` starts a crawl with a JSON configuration
+  - `GET /api/status` returns a JSON snapshot
+  - `GET /api/search` runs a query against the live index
 
-### 7.7 Persistence (Bonus): Resumable Crawling and Indexing
+### 7.9 Persistence (Bonus): Resumable Crawling and Indexing
 The system should support:
 1. **Checkpointing cadence:** periodic snapshots (e.g., every N seconds or after M indexed documents).
 2. **Restart behavior:**
@@ -348,7 +364,7 @@ Persistence scope suggestion:
 ## 10. Ranking and Relevance Model (Phase 1)
 To satisfy lexical matching without heavy libraries:
 1. Tokenize page text derived from HTML:
-   - Extract visible text from HTML body (Phase 1 can use a conservative approach: tokenize all text nodes).
+   - Extract visible text from HTML body.
 2. Normalize tokens:
    - lowercase
    - remove punctuation
@@ -398,6 +414,18 @@ Ranking must be deterministic:
   - `document store` snapshot (DocID -> DocMeta)
   - index snapshot (optional) or an append-only update log
 
+**Visited persistence (required for resumability):**
+- Persist the visited set as an append-only file `visited_urls.data`.
+- Format: one normalized URL per line (UTF-8), e.g.
+  - `https://example.com/page1`
+  - `https://example.com/page2`
+- Checkpoint behavior:
+  - On checkpoint, flush newly visited URLs to `visited_urls.data`.
+  - On restart, load `visited_urls.data` into the in-memory visited structure before resuming scheduling.
+- Correctness requirement:
+  - Loading the file must be idempotent (duplicate lines must not break behavior).
+  - URL normalization rules used for this file must match the crawler’s runtime normalization.
+
 ### 12.2 Crash Recovery Workflow
 1. On restart:
    - load last checkpoint
@@ -424,7 +452,8 @@ Ranking must be deterministic:
 4. **Back-pressure:** System remains stable under load; queue depth is bounded by configuration.
 5. **Search triple contract:** Results are triples `(relevant_url, origin_url, depth)` with accurate metadata.
 6. **Dashboard:** Dashboard displays live metrics including queue depth and throttling status.
-7. **Bonus resumability:** Restart resumes with controlled duplication and without losing crawl state.
+7. **Memory stability:** RAM usage remains bounded by enforcing max page size, releasing page bodies after processing, and periodically flushing/clearing the inverted index to disk.
+8. **Bonus resumability:** Restart resumes with controlled duplication and without losing crawl state.
 
 ---
 
@@ -436,9 +465,11 @@ Ranking must be deterministic:
 3. **Deadlocks caused by bounded channels**
    - Mitigation: carefully design producer/consumer flow; ensure workers can progress even when queues are full; use timeouts where needed.
 4. **High memory usage from storing large pages**
-   - Mitigation: enforce max page size and avoid storing full bodies longer than necessary.
+   - Mitigation: enforce max page size, do not retain full HTML bodies beyond extraction/tokenization, and flush index segments to disk.
 5. **Search returns incomplete results early**
    - Mitigation: define eventual consistency; display “indexed docs so far” on dashboard.
+6. **Append-only disk index duplication**
+   - Mitigation: treat disk segments as write-ahead logs and either deduplicate at query time or compact periodically.
 
 ---
 

@@ -1,19 +1,860 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Google in a Day - Search</title>
-    <style>
-        body { font-family: sans-serif; text-align: center; margin-top: 20%; }
-        input[type="text"] { padding: 10px; width: 300px; font-size: 16px; }
-        input[type="submit"] { padding: 10px 20px; font-size: 16px; }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebCrawler Control Plane</title>
+  <style>
+    :root {
+      --bg: #1a1a1a;
+      --panel: #232323;
+      --panel-2: #2a2a2a;
+      --text: #ffffff;
+      --muted: rgba(255,255,255,0.72);
+      --muted-2: rgba(255,255,255,0.55);
+      --border: rgba(255,255,255,0.12);
+      --accent: #FFD700;
+      --accent-2: #ffea4d;
+      --danger: #ff4d4f;
+      --ok: #33d17a;
+      --shadow: 0 12px 30px rgba(0,0,0,0.45);
+      --radius: 14px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: radial-gradient(1200px 700px at 20% -10%, rgba(255, 215, 0, 0.08), transparent 55%),
+                  radial-gradient(900px 500px at 85% -15%, rgba(255, 215, 0, 0.06), transparent 60%),
+                  var(--bg);
+      color: var(--text);
+      line-height: 1.35;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .app {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Top bar */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(26,26,26,0.82);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .topbar-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      white-space: nowrap;
+    }
+
+    .brand-badge {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(255,215,0,0.18), rgba(255,215,0,0.06));
+      border: 1px solid rgba(255,215,0,0.35);
+      box-shadow: 0 0 0 3px rgba(255,215,0,0.05);
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      font-weight: 800;
+      letter-spacing: 0.06em;
+    }
+
+    .brand-meta { display: flex; flex-direction: column; gap: 2px; }
+    .brand-title { font-size: 14px; font-weight: 800; letter-spacing: 0.04em; }
+    .brand-sub { font-size: 12px; color: var(--muted-2); }
+
+    .nav {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .nav button {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+    }
+
+    .nav button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(255,215,0,0.45);
+      background: rgba(255,215,0,0.07);
+    }
+
+    .nav button.active {
+      border-color: rgba(255,215,0,0.65);
+      background: rgba(255,215,0,0.12);
+      box-shadow: 0 0 0 3px rgba(255,215,0,0.06);
+      color: var(--accent);
+    }
+
+    /* Layout */
+    .content {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 18px;
+      width: 100%;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .view { display: none; }
+    .view.active { display: block; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 18px;
+    }
+
+    @media (max-width: 980px) {
+      .grid { grid-template-columns: 1fr; }
+      .topbar-inner { align-items: flex-start; }
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), transparent 65%), var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .panel h2 {
+      margin: 0 0 14px 0;
+      font-size: 16px;
+      color: var(--text);
+      letter-spacing: 0.02em;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: var(--muted-2);
+      margin-top: -10px;
+      margin-bottom: 14px;
+    }
+
+    .form {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      align-items: end;
+    }
+
+    .form .field { display: flex; flex-direction: column; gap: 8px; }
+    .form .field.full { grid-column: 1 / -1; }
+
+    label {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    input[type="text"],
+    input[type="number"] {
+      width: 100%;
+      padding: 12px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.13);
+      background: rgba(0,0,0,0.28);
+      color: var(--text);
+      outline: none;
+      transition: border-color 120ms ease, box-shadow 120ms ease;
+    }
+
+    input[type="text"]::placeholder { color: rgba(255,255,255,0.35); }
+
+    input[type="text"]:focus,
+    input[type="number"]:focus {
+      border-color: rgba(255,215,0,0.55);
+      box-shadow: 0 0 0 3px rgba(255,215,0,0.08);
+    }
+
+    .actions { display: flex; gap: 12px; }
+
+    .btn {
+      appearance: none;
+      border: 1px solid rgba(255,215,0,0.55);
+      background: linear-gradient(180deg, rgba(255,215,0,0.18), rgba(255,215,0,0.10));
+      color: var(--accent);
+      font-weight: 900;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border-radius: 14px;
+      padding: 14px 16px;
+      cursor: pointer;
+      transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+    }
+
+    .btn:hover { transform: translateY(-1px); box-shadow: 0 0 0 3px rgba(255,215,0,0.08); }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; box-shadow: none; }
+
+    .btn.secondary {
+      border-color: rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      text-transform: none;
+    }
+
+    .big {
+      width: 100%;
+      padding: 16px 18px;
+      font-size: 14px;
+    }
+
+    /* Status cards */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    @media (max-width: 980px) {
+      .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    .stat {
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), transparent 70%), var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 14px;
+      min-height: 84px;
+    }
+
+    .stat-k { font-size: 12px; color: var(--muted-2); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 800; }
+    .stat-v { margin-top: 10px; font-size: 18px; font-weight: 900; word-break: break-word; }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.25);
+      font-weight: 900;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-size: 12px;
+    }
+
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 4px rgba(255,77,79,0.10); }
+    .pill.active .dot { background: var(--ok); box-shadow: 0 0 0 4px rgba(51,209,122,0.12); }
+
+    .progress {
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      overflow: hidden;
+      height: 14px;
+      background: rgba(0,0,0,0.25);
+    }
+
+    .progress > div {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, rgba(255,215,0,0.30), rgba(255,215,0,0.85));
+      transition: width 200ms ease;
+    }
+
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
+    .recent {
+      margin-top: 14px;
+      border-top: 1px solid var(--border);
+      padding-top: 14px;
+    }
+
+    .recent h3 {
+      margin: 0 0 10px 0;
+      font-size: 13px;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .log {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 10px;
+    }
+
+    .log li {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 12px;
+      padding: 10px 12px;
+      color: rgba(255,255,255,0.85);
+    }
+
+    .log li.active {
+      border-color: rgba(255,215,0,0.45);
+      background: rgba(255,215,0,0.07);
+      color: var(--text);
+    }
+
+    /* Search view */
+    .search-wrap {
+      display: grid;
+      place-items: center;
+      min-height: calc(100vh - 88px);
+      padding: 24px 0;
+    }
+
+    .search-box {
+      width: min(820px, 100%);
+      display: grid;
+      gap: 14px;
+    }
+
+    .search-input-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .search-input-row input {
+      padding: 14px 14px;
+      border-radius: 16px;
+      font-size: 14px;
+    }
+
+    .search-results {
+      display: grid;
+      gap: 12px;
+    }
+
+    .result-card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), transparent 60%), var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 14px;
+      box-shadow: var(--shadow);
+    }
+
+    .result-title {
+      font-weight: 900;
+      margin: 0 0 6px 0;
+      font-size: 14px;
+      letter-spacing: 0.01em;
+    }
+
+    .result-url {
+      margin: 0 0 10px 0;
+      color: var(--muted);
+      word-break: break-all;
+      font-size: 13px;
+    }
+
+    .result-meta {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      color: var(--muted-2);
+      font-size: 12px;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.75);
+      border: 1px solid rgba(255,255,255,0.14);
+      padding: 10px 12px;
+      border-radius: 999px;
+      color: var(--text);
+      font-size: 12px;
+      box-shadow: var(--shadow);
+      display: none;
+      max-width: min(900px, calc(100% - 36px));
+    }
+
+    .toast.show { display: inline-flex; align-items: center; gap: 10px; }
+    .toast strong { color: var(--accent); }
+  </style>
 </head>
 <body>
-    <h1>🎸 Google in a Day 🎸</h1>
-    <form action="/search" method="get">
-        <input type="text" name="q" placeholder="The Trooper..." required />
-        <input type="submit" value="Search" />
-    </form>
+  <div class="app">
+    <div class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <div class="brand-badge">WC</div>
+          <div class="brand-meta">
+            <div class="brand-title">WebCrawler Control Plane</div>
+            <div class="brand-sub">Crawl • Observe • Search</div>
+          </div>
+        </div>
+
+        <div class="nav" role="navigation" aria-label="Primary">
+          <button type="button" class="nav-btn active" data-view="config">Crawler Config</button>
+          <button type="button" class="nav-btn" data-view="status">Crawl Status</button>
+          <button type="button" class="nav-btn" data-view="search">Search Engine</button>
+        </div>
+      </div>
+    </div>
+
+    <main class="content">
+      <!-- CONFIG VIEW -->
+      <section class="view active" id="view-config" aria-label="Crawler Config">
+        <div class="grid">
+          <div class="panel">
+            <h2>Crawler Configuration</h2>
+            <div class="hint">Set constraints and start a crawl. Values are posted to <span class="mono">/api/crawl</span>.</div>
+
+            <form id="crawlForm" class="form">
+              <div class="field full">
+                <label for="startURL">Origin URL</label>
+                <input id="startURL" name="startURL" type="text" placeholder="https://example.com" value="https://en.wikipedia.org/wiki/Iron_Maiden" required />
+              </div>
+
+              <div class="field">
+                <label for="maxURLs">Max URLs</label>
+                <input id="maxURLs" name="maxURLs" type="number" min="1" max="200000" value="500" required />
+              </div>
+
+              <div class="field">
+                <label for="maxDepth">Max Depth</label>
+                <input id="maxDepth" name="maxDepth" type="number" min="0" max="20" value="1" required />
+              </div>
+
+              <div class="field">
+                <label for="queueCapacity">Queue Capacity</label>
+                <input id="queueCapacity" name="queueCapacity" type="number" min="10" max="100000" value="200" required />
+              </div>
+
+              <div class="field">
+                <label for="hitRate">Hit Rate (delay ms)</label>
+                <input id="hitRate" name="hitRate" type="number" min="0" max="600000" value="0" required />
+              </div>
+
+              <div class="field full actions">
+                <button id="startBtn" type="submit" class="btn big">Start Crawling</button>
+                <button id="resetBtn" type="button" class="btn secondary big">Reset</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="panel">
+            <h2>Operational Notes</h2>
+            <div class="hint">Live status is pulled from <span class="mono">/api/status</span> every 1s.</div>
+
+            <div class="stat-grid">
+              <div class="stat">
+                <div class="stat-k">Current Status</div>
+                <div class="stat-v" id="statusPill">
+                  <span class="pill"><span class="dot"></span> Idle</span>
+                </div>
+              </div>
+              <div class="stat">
+                <div class="stat-k">Pages Crawled</div>
+                <div class="stat-v" id="pagesCrawled">0</div>
+              </div>
+              <div class="stat">
+                <div class="stat-k">Last URL</div>
+                <div class="stat-v mono" id="lastURL">-</div>
+              </div>
+              <div class="stat">
+                <div class="stat-k">Elapsed</div>
+                <div class="stat-v" id="elapsed">0s</div>
+              </div>
+            </div>
+
+            <div class="progress" aria-label="Crawl progress">
+              <div id="progressFill"></div>
+            </div>
+            <div class="progress-meta">
+              <div id="progressText">0 / 0</div>
+              <div id="progressPct">0%</div>
+            </div>
+
+            <div class="recent">
+              <h3>Last 5 URLs</h3>
+              <ul class="log" id="recentURLs">
+                <li class="active">Waiting for crawl to start…</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- STATUS VIEW -->
+      <section class="view" id="view-status" aria-label="Crawl Status">
+        <div class="panel">
+          <h2>Live Crawl Dashboard</h2>
+          <div class="hint">Monitoring view. Updates automatically every 1 second.</div>
+
+          <div class="stat-grid">
+            <div class="stat">
+              <div class="stat-k">Current Status</div>
+              <div class="stat-v" id="statusPill2">
+                <span class="pill"><span class="dot"></span> Idle</span>
+              </div>
+            </div>
+            <div class="stat">
+              <div class="stat-k">Total Pages Crawled</div>
+              <div class="stat-v" id="pagesCrawled2">0</div>
+            </div>
+            <div class="stat" style="grid-column: span 2;">
+              <div class="stat-k">Last Crawled URL</div>
+              <div class="stat-v mono" id="lastURL2">-</div>
+            </div>
+          </div>
+
+          <div class="progress" aria-label="Crawl progress">
+            <div id="progressFill2"></div>
+          </div>
+          <div class="progress-meta">
+            <div id="progressText2">0 / 0</div>
+            <div id="progressPct2">0%</div>
+          </div>
+
+          <div class="recent">
+            <h3>Last 5 URLs</h3>
+            <ul class="log" id="recentURLs2">
+              <li class="active">Waiting for crawl to start…</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- SEARCH VIEW -->
+      <section class="view" id="view-search" aria-label="Search Engine">
+        <div class="search-wrap">
+          <div class="search-box">
+            <div>
+              <h2 style="margin:0 0 8px 0; font-size:16px;">Search Engine</h2>
+              <div class="hint" style="margin:0;">Query <span class="mono">/api/search?q=...</span>. Results show title, URL and score.</div>
+            </div>
+
+            <div class="search-input-row">
+              <input id="searchQuery" type="text" placeholder="Type keywords…" autocomplete="off" />
+              <button id="searchBtn" class="btn" type="button">Search</button>
+            </div>
+
+            <div id="searchResults" class="search-results"></div>
+          </div>
+        </div>
+      </section>
+
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </main>
+  </div>
+
+  <script>
+    // State
+    let pollTimer = null;
+    let lastView = 'config';
+
+    // Helpers
+    function $(id) { return document.getElementById(id); }
+
+    function escapeHTML(str) {
+      const div = document.createElement('div');
+      div.textContent = String(str ?? '');
+      return div.innerHTML;
+    }
+
+    function truncate(str, max = 80) {
+      const s = String(str ?? '');
+      if (!s) return '-';
+      return s.length > max ? (s.slice(0, max) + '…') : s;
+    }
+
+    function fmtTime(seconds) {
+      const s = Math.max(0, Number(seconds || 0));
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const r = Math.floor(s % 60);
+      if (h > 0) return `${h}h ${m}m ${r}s`;
+      if (m > 0) return `${m}m ${r}s`;
+      return `${r}s`;
+    }
+
+    function showToast(message, kind = 'info') {
+      const toast = $('toast');
+      toast.innerHTML = kind === 'error'
+        ? `<strong>Error</strong> ${escapeHTML(message)}`
+        : `<strong>Info</strong> ${escapeHTML(message)}`;
+      toast.classList.add('show');
+      window.clearTimeout(showToast._t);
+      showToast._t = window.setTimeout(() => toast.classList.remove('show'), 2600);
+    }
+
+    function setActiveView(viewName) {
+      lastView = viewName;
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.view === viewName);
+      });
+      document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+      const target = $(`view-${viewName}`);
+      if (target) target.classList.add('active');
+
+      // focus search input when navigating to search
+      if (viewName === 'search') {
+        window.setTimeout(() => $('searchQuery')?.focus(), 50);
+      }
+    }
+
+    // Navigation
+    function initNav() {
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.addEventListener('click', () => setActiveView(btn.dataset.view));
+      });
+    }
+
+    // Crawl form
+    async function startCrawl(e) {
+      e.preventDefault();
+
+      const payload = {
+        startURL: $('startURL').value.trim(),
+        maxURLs: parseInt($('maxURLs').value, 10),
+        maxDepth: parseInt($('maxDepth').value, 10),
+        queueCapacity: parseInt($('queueCapacity').value, 10),
+        delayMs: parseInt($('hitRate').value, 10)
+      };
+
+      if (!payload.startURL) {
+        showToast('Origin URL is required.', 'error');
+        return;
+      }
+
+      try {
+        $('startBtn').disabled = true;
+        const res = await fetch('/api/crawl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!res.ok) {
+          let msg = `HTTP ${res.status}`;
+          try {
+            const err = await res.json();
+            msg = err?.error || msg;
+          } catch {
+            // ignore
+          }
+          showToast(msg, 'error');
+          return;
+        }
+
+        showToast('Crawl started. Switch to Crawl Status to monitor.');
+        setActiveView('status');
+      } catch (err) {
+        showToast(err?.message || 'Failed to start crawl', 'error');
+      } finally {
+        $('startBtn').disabled = false;
+      }
+    }
+
+    function resetForm() {
+      $('startURL').value = 'https://en.wikipedia.org/wiki/Iron_Maiden';
+      $('maxURLs').value = '500';
+      $('maxDepth').value = '1';
+      $('queueCapacity').value = '200';
+      $('hitRate').value = '0';
+    }
+
+    // Status polling
+    function renderStatus(status) {
+      const running = !!status?.isRunning;
+      const pages = Number(status?.pagesCrawled || 0);
+      const max = Number(status?.maxURLs || 0);
+      const lastURL = status?.lastURL || '';
+      const pct = Number.isFinite(status?.progress) ? Number(status.progress) : (max > 0 ? (pages / max) * 100 : 0);
+      const pctClamped = Math.max(0, Math.min(100, pct));
+      const elapsed = fmtTime(status?.elapsedSeconds || 0);
+      const recent = Array.isArray(status?.recentURLs) ? status.recentURLs : [];
+
+      const pillHTML = running
+        ? '<span class="pill active"><span class="dot"></span> Active</span>'
+        : '<span class="pill"><span class="dot"></span> Idle</span>';
+
+      // config sidebar
+      $('statusPill').innerHTML = pillHTML;
+      $('pagesCrawled').textContent = String(pages);
+      $('lastURL').textContent = truncate(lastURL, 120);
+      $('elapsed').textContent = elapsed;
+
+      $('progressFill').style.width = `${pctClamped}%`;
+      $('progressText').textContent = `${pages} / ${max}`;
+      $('progressPct').textContent = `${Math.round(pctClamped)}%`;
+
+      // status view
+      $('statusPill2').innerHTML = pillHTML;
+      $('pagesCrawled2').textContent = String(pages);
+      $('lastURL2').textContent = truncate(lastURL, 160);
+
+      $('progressFill2').style.width = `${pctClamped}%`;
+      $('progressText2').textContent = `${pages} / ${max}`;
+      $('progressPct2').textContent = `${Math.round(pctClamped)}%`;
+
+      // recent urls
+      const items = recent.slice(0, 5);
+      const html = items.length
+        ? items.map((u, i) => `<li class="${i === 0 ? 'active' : ''}"><span class="mono">${escapeHTML(truncate(u, 140))}</span></li>`).join('')
+        : '<li class="active">Waiting for crawl to start…</li>';
+      $('recentURLs').innerHTML = html;
+      $('recentURLs2').innerHTML = html;
+
+      // start button disable
+      $('startBtn').disabled = running;
+    }
+
+    async function pollStatusOnce() {
+      try {
+        const res = await fetch('/api/status', { cache: 'no-store' });
+        if (!res.ok) return;
+        const status = await res.json();
+        renderStatus(status);
+      } catch {
+        // silent to avoid console noise during server restarts
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) window.clearInterval(pollTimer);
+      pollTimer = window.setInterval(pollStatusOnce, 1000);
+      pollStatusOnce();
+    }
+
+    // Search
+    function renderSearchResults(results) {
+      const root = $('searchResults');
+
+      if (!results) {
+        root.innerHTML = '';
+        return;
+      }
+
+      if (!Array.isArray(results) || results.length === 0) {
+        root.innerHTML = `<div class="result-card"><div class="result-title">No results</div><div class="result-url">Try crawling first, then search again.</div></div>`;
+        return;
+      }
+
+      root.innerHTML = results.map(r => {
+        const title = r?.title || r?.Title || ''; // tolerate casing
+        const url = r?.url || r?.URL || '';
+        const score = r?.score ?? r?.Score;
+
+        const safeTitle = title && String(title).trim().length > 0 ? escapeHTML(title) : 'Untitled';
+        const safeUrl = escapeHTML(url);
+        const scoreText = (score === undefined || score === null) ? '-' : escapeHTML(String(score));
+
+        return `
+          <div class="result-card">
+            <div class="result-title">${safeTitle}</div>
+            <div class="result-url"><a href="${safeUrl}" target="_blank" rel="noreferrer">${safeUrl}</a></div>
+            <div class="result-meta">
+              <div><span class="mono">score</span>: <span class="mono">${scoreText}</span></div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function doSearch() {
+      const q = $('searchQuery').value.trim();
+      if (!q) {
+        showToast('Search query is empty.', 'error');
+        return;
+      }
+
+      $('searchResults').innerHTML = `<div class="result-card"><div class="result-title">Searching…</div><div class="result-url">Please wait.</div></div>`;
+
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { cache: 'no-store' });
+        if (!res.ok) {
+          showToast(`Search failed (HTTP ${res.status})`, 'error');
+          renderSearchResults([]);
+          return;
+        }
+        const results = await res.json();
+        renderSearchResults(results);
+      } catch (err) {
+        showToast(err?.message || 'Search failed', 'error');
+        renderSearchResults([]);
+      }
+    }
+
+    function initSearch() {
+      $('searchBtn').addEventListener('click', doSearch);
+      $('searchQuery').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          doSearch();
+        }
+      });
+    }
+
+    // Boot
+    document.addEventListener('DOMContentLoaded', () => {
+      initNav();
+      $('crawlForm').addEventListener('submit', startCrawl);
+      $('resetBtn').addEventListener('click', resetForm);
+      initSearch();
+      startPolling();
+
+      // default
+      setActiveView(lastView);
+    });
+
+    window.addEventListener('beforeunload', () => {
+      if (pollTimer) window.clearInterval(pollTimer);
+    });
+  </script>
 </body>
 </html>

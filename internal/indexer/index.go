@@ -1,9 +1,7 @@
 package indexer
 
 import (
-	"fmt"
 	"hash/fnv"
-	"strings"
 	"sync"
 )
 
@@ -59,10 +57,6 @@ func (idx *InvertedIndex) AddDocument(docID uint64, tokens []string) {
 	for token, count := range docTokenCounts {
 		shardIdx := idx.shardForToken(token)
 		shard := &idx.shards[shardIdx]
-
-		if strings.Contains(token, "trooper") {
-			fmt.Printf("🎯 [Indexer] MATCH! 'trooper' eklendi -> DocID: %d, Shard: %d, Count: %d\n", docID, shardIdx, count)
-		}
 
 		shard.mu.Lock()
 		postingForToken, ok := shard.postings[token]

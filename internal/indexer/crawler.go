@@ -1,12 +1,15 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/html" // Bu, Go ekibinin standart HTML ayrıştırıcısıdır.
@@ -300,7 +303,9 @@ func Crawl(
 	maxDepthK int,
 	frontierQueueCapacity int,
 	maxConcurrency int,
+	maxURLs int,
 	invertedIndex *InvertedIndex,
+	onProgress func(url string, pagesCrawled int),
 ) (*DocumentStore, error) {
 	if fetcher == nil {
 		return nil, fmt.Errorf("fetcher is nil")
@@ -320,9 +325,15 @@ func Crawl(
 	if maxConcurrency <= 0 {
 		return nil, fmt.Errorf("maxConcurrency must be > 0")
 	}
+	if maxURLs <= 0 {
+		maxURLs = int(^uint(0) >> 1) // effectively unlimited
+	}
 	if originURL == "" {
 		originURL = startURL
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	originParsed, parseErr := url.Parse(originURL)
 	if parseErr != nil {
@@ -349,8 +360,11 @@ func Crawl(
 		dispatchWG sync.WaitGroup
 	)
 
+	var pagesCrawled uint64
+
 	stop := func() {
 		closeOnce.Do(func() {
+			cancel()
 			discoveredQueue.close()
 			close(frontier)
 		})
@@ -389,7 +403,11 @@ func Crawl(
 			if !ok {
 				return
 			}
-			frontier <- job
+			select {
+			case <-ctx.Done():
+				return
+			case frontier <- job:
+			}
 		}
 	}()
 
@@ -397,72 +415,105 @@ func Crawl(
 	for i := 0; i < maxConcurrency; i++ {
 		go func() {
 			defer workerWG.Done()
-			for job := range frontier {
-				fmt.Printf("Worker %d taranıyor: %s (Derinlik: %d)\n", i, job.URL, job.Depth)
-				if allowedHost != "" {
-					u, err := url.Parse(job.URL)
-					if err != nil || u.Hostname() != allowedHost {
-						dec()
-						continue
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-frontier:
+					if !ok {
+						return
 					}
-				}
 
-				// Dedup happens right before fetching.
-				if store.AddVisited(job.URL) {
-					page, err := fetcher.Fetch(job)
-					if err == nil {
-						fmt.Printf("[Crawler] URL: %s | Sayfa boyutu: %d bayt\n", page.URL, len(page.Body))
-						// Tokenize and index the fetched page.
-						tokens := Tokenize(page.Body)
-
-						if len(tokens) > 0 {
-							limit := len(tokens)
-							if limit > 20 {
-								limit = 20
-							}
-							fmt.Printf("[Crawler] İlk %d token: %v\n", limit, tokens[:limit])
-						} else {
-							fmt.Println("[Crawler] Hiç token bulunamadı!")
+					if allowedHost != "" {
+						u, err := url.Parse(job.URL)
+						if err != nil || u.Hostname() != allowedHost {
+							dec()
+							continue
 						}
+					}
 
-						docID := urlDocMap.GetOrCreate(page.URL)
-						docStore.Add(docID, DocMeta{
-							DocURL:    page.URL,
-							OriginURL: job.OriginURL,
-							Depth:     job.Depth,
-						})
+					// Strict maxURLs enforcement: reserve a slot BEFORE fetching.
+					reserved := atomic.AddUint64(&pagesCrawled, 1)
+					if int(reserved) > maxURLs {
+						stop()
+						dec()
+						return
+					}
 
-						fmt.Printf("[Crawler] %s URL'si %d token ile AddDocument'a gönderiliyor\n", page.URL, len(tokens))
-						invertedIndex.AddDocument(docID, tokens)
+					// Dedup happens right before fetching.
+					if store.AddVisited(job.URL) {
+						page, err := fetcher.Fetch(job)
+						if err == nil {
+							// Tokenize and index the fetched page.
+							tokens := Tokenize(page.Body)
 
-						// Only expand links when we are under the depth limit.
-						if job.Depth < maxDepthK {
-							base, err := url.Parse(job.URL)
-							if err == nil && base != nil {
-								links, err := ExtractLinks(strings.NewReader(page.Body), base, allowedHost)
-								if err == nil {
-									for _, link := range links {
-										// Extra safety: only enqueue links from the same host.
-										if allowedHost != "" {
-											lu, err := url.Parse(link)
-											if err != nil || lu.Hostname() != allowedHost {
-												continue
-											}
-										}
-										inc()
-										discoveredQueue.push(CrawlJob{
-											URL:       link,
-											OriginURL: job.OriginURL,
-											Depth:     job.Depth + 1,
-										})
+							// Extract links before dropping the body.
+							var extractedLinks []string
+							if job.Depth < maxDepthK {
+								base, err := url.Parse(job.URL)
+								if err == nil && base != nil {
+									links, err := ExtractLinks(strings.NewReader(page.Body), base, allowedHost)
+									if err == nil {
+										extractedLinks = links
 									}
 								}
 							}
+
+							// Drop the HTML body completely to save memory
+							page.Body = ""
+
+							docID := urlDocMap.GetOrCreate(page.URL)
+							docStore.Add(docID, DocMeta{
+								DocURL:    page.URL,
+								OriginURL: job.OriginURL,
+								Depth:     job.Depth,
+							})
+
+							invertedIndex.AddDocument(docID, tokens)
+
+							// Progress callback + GC every 100 pages
+							if onProgress != nil {
+								onProgress(page.URL, int(reserved))
+							}
+							if reserved%100 == 0 {
+								_ = FlushAndClearToDisk(invertedIndex, docStore)
+								runtime.GC()
+							}
+
+							// Stop discovering new links if we already reached the limit.
+							if int(reserved) >= maxURLs {
+								stop()
+								dec()
+								return
+							}
+
+							// Enqueue extracted links
+						linkLoop:
+							for _, link := range extractedLinks {
+								select {
+								case <-ctx.Done():
+									break linkLoop
+								default:
+								}
+								// Extra safety: only enqueue links from the same host.
+								if allowedHost != "" {
+									lu, err := url.Parse(link)
+									if err != nil || lu.Hostname() != allowedHost {
+										continue
+									}
+								}
+								inc()
+								discoveredQueue.push(CrawlJob{
+									URL:       link,
+									OriginURL: job.OriginURL,
+									Depth:     job.Depth + 1,
+								})
+							}
 						}
 					}
-				}
 
-				dec()
+					dec()
+				}
 			}
 		}()
 	}
