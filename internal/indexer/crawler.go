@@ -1,9 +1,13 @@
 package indexer
 
 import (
+	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -108,6 +112,17 @@ func NewFetcher(timeout time.Duration, maxSize int64) *Fetcher {
 	return &Fetcher{
 		client: &http.Client{
 			Timeout: timeout, // Zaman aşımı kontrolü
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				// Avoid redirect loops / huge chains.
+				if len(via) >= 10 {
+					return fmt.Errorf("stopped after 10 redirects")
+				}
+				// Keep headers across redirects.
+				if len(via) > 0 {
+					req.Header = via[len(via)-1].Header.Clone()
+				}
+				return nil
+			},
 		},
 		maxSize: maxSize,
 	}
@@ -120,16 +135,30 @@ func (f *Fetcher) Fetch(job CrawlJob) (*FetchedPage, error) {
 		return nil, err
 	}
 
-	// Wikipedia and other sites require a User-Agent header to not serve a 403 Forbidden
-	req.Header.Set("User-Agent", "Google-in-a-Day/1.0 Crawler (Educational Project)")
+	// User-Agent spoofing: use a realistic modern UA to avoid 403/light pages.
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+	// Common accept headers reduce the chance of being served non-standard variants.
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set("Connection", "keep-alive")
 
 	resp, err := f.client.Do(req)
 	if err != nil {
+		// Detailed error logging for timeouts / dial errors etc.
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			log.Printf("[fetch][timeout] url=%s err=%v", job.URL, err)
+		} else {
+			log.Printf("[fetch][error] url=%s err=%v", job.URL, err)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	// Log non-OK statuses to diagnose blocking/rate limits.
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("[fetch][status] url=%s status=%d", job.URL, resp.StatusCode)
 		return nil, fmt.Errorf("status code: %d", resp.StatusCode)
 	}
 
@@ -139,8 +168,19 @@ func (f *Fetcher) Fetch(job CrawlJob) (*FetchedPage, error) {
 		return nil, fmt.Errorf("non-html content: %s", contentType)
 	}
 
+	// Handle gzip if present (Accept-Encoding: gzip).
+	var bodySrc io.Reader = resp.Body
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Encoding")), "gzip") {
+		gz, gzErr := gzip.NewReader(resp.Body)
+		if gzErr != nil {
+			return nil, gzErr
+		}
+		defer gz.Close()
+		bodySrc = gz
+	}
+
 	// Bellek şişmesini önlemek için okuma sınırla
-	bodyReader := io.LimitReader(resp.Body, f.maxSize)
+	bodyReader := io.LimitReader(bodySrc, f.maxSize)
 	bodyBytes, err := io.ReadAll(bodyReader)
 	if err != nil {
 		return nil, err
@@ -156,11 +196,44 @@ func (f *Fetcher) Fetch(job CrawlJob) (*FetchedPage, error) {
 	}, nil
 }
 
+// normalizeAndFilterLink resolves u against base, enforces allowedHost, strips fragments,
+// and rejects mailto/javascript and common non-web schemes.
+func normalizeAndFilterLink(href string, base *url.URL, allowedHost string) (string, bool) {
+	href = strings.TrimSpace(href)
+	if href == "" {
+		return "", false
+	}
+	lower := strings.ToLower(href)
+	if strings.HasPrefix(lower, "mailto:") || strings.HasPrefix(lower, "javascript:") || strings.HasPrefix(lower, "tel:") {
+		return "", false
+	}
+
+	u, err := url.Parse(href)
+	if err != nil {
+		return "", false
+	}
+	resolved := base.ResolveReference(u)
+
+	// Only http(s)
+	scheme := strings.ToLower(resolved.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+
+	// Strip fragment (#section) to avoid over-aggressive duplicate skipping.
+	resolved.Fragment = ""
+
+	if allowedHost != "" && resolved.Hostname() != allowedHost {
+		return "", false
+	}
+	return resolved.String(), true
+}
+
 // ExtractLinks reads HTML and extracts links resolved against base.
 // It filters to links that match allowedHost (by hostname only).
 func ExtractLinks(body io.Reader, base *url.URL, allowedHost string) ([]string, error) {
 	var links []string
-	z := html.NewTokenizer(body) // İşte golang.org/x/net/html burada kullanılıyor!
+	z := html.NewTokenizer(body)
 
 	binaryExts := []string{
 		".zip",
@@ -196,43 +269,91 @@ func ExtractLinks(body io.Reader, base *url.URL, allowedHost string) ([]string, 
 		switch tt {
 		case html.ErrorToken:
 			if z.Err() == io.EOF {
-				return links, nil // Sayfa bitti
+				return links, nil
 			}
 			return nil, z.Err()
 
 		case html.StartTagToken, html.SelfClosingTagToken:
 			t := z.Token()
-			if t.Data == "a" { // <a> etiketi bulduk
+			if t.Data == "a" {
 				for _, a := range t.Attr {
-					if a.Key == "href" {
-						// Linki ana URL'e göre temizle/çözümle
-						u, err := url.Parse(a.Val) // İşte net/url burada kullanılıyor!
-						if err != nil {
-							continue
-						}
-						// Göreceli linkleri tam URL'e çevirir (/about -> https://google.com/about)
-						resolved := base.ResolveReference(u)
-						if allowedHost != "" && resolved.Hostname() != allowedHost {
-							continue
-						}
-
-						// Skip common binary file types (by URL path suffix).
-						pathLower := strings.ToLower(resolved.Path)
-						skip := false
-						for _, ext := range binaryExts {
-							if strings.HasSuffix(pathLower, ext) {
-								skip = true
-								break
-							}
-						}
-						if skip {
-							continue
-						}
-
-						links = append(links, resolved.String())
+					if a.Key != "href" {
+						continue
 					}
+
+					resolvedStr, ok := normalizeAndFilterLink(a.Val, base, allowedHost)
+					if !ok {
+						continue
+					}
+
+					resolved, err := url.Parse(resolvedStr)
+					if err != nil {
+						continue
+					}
+
+					// Skip common binary file types (by URL path suffix).
+					pathLower := strings.ToLower(resolved.Path)
+					skip := false
+					for _, ext := range binaryExts {
+						if strings.HasSuffix(pathLower, ext) {
+							skip = true
+							break
+						}
+					}
+					if skip {
+						continue
+					}
+
+					links = append(links, resolvedStr)
 				}
 			}
+		}
+	}
+}
+
+// ExtractVisibleText converts HTML to visible text by walking tokens and:
+// - skipping script/style/noscript/template/svg
+// - inserting spaces between text chunks
+func ExtractVisibleText(htmlStr string) string {
+	z := html.NewTokenizer(strings.NewReader(htmlStr))
+	var b strings.Builder
+	b.Grow(len(htmlStr) / 4)
+
+	skipDepth := 0
+	for {
+		tt := z.Next()
+		switch tt {
+		case html.ErrorToken:
+			if z.Err() == io.EOF {
+				return b.String()
+			}
+			return b.String()
+		case html.StartTagToken:
+			tok := z.Token()
+			switch tok.Data {
+			case "script", "style", "noscript", "template", "svg":
+				skipDepth++
+			}
+		case html.EndTagToken:
+			tok := z.Token()
+			switch tok.Data {
+			case "script", "style", "noscript", "template", "svg":
+				if skipDepth > 0 {
+					skipDepth--
+				}
+			}
+		case html.TextToken:
+			if skipDepth > 0 {
+				continue
+			}
+			text := strings.TrimSpace(html.UnescapeString(string(z.Text())))
+			if text == "" {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(text)
 		}
 	}
 }
@@ -444,8 +565,9 @@ func Crawl(
 					if store.AddVisited(job.URL) {
 						page, err := fetcher.Fetch(job)
 						if err == nil {
-							// Tokenize and index the fetched page.
-							tokens := Tokenize(page.Body)
+							// Extract visible text for indexing (captures body text; avoids markup).
+							visibleText := ExtractVisibleText(page.Body)
+							tokens := Tokenize(visibleText)
 
 							// Extract links before dropping the body.
 							var extractedLinks []string

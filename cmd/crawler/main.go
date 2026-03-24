@@ -126,6 +126,12 @@ func (m *CrawlManager) SetMaxURLs(max int) {
 }
 
 func main() {
+	logFile, err := indexer.SetupLogger(".", false)
+	if err != nil {
+		panic(err)
+	}
+	defer logFile.Close()
+
 	fmt.Println("🎸 Google in a Day: Dynamic Dashboard Edition 🎸")
 	fmt.Println("--------------------------------------------------")
 	fmt.Println("✅ Crawler initialized. Waiting for API commands...")
@@ -265,7 +271,7 @@ func main() {
 				}
 
 				// Export visited URLs as required output artifact.
-				if path, vErr := indexer.WriteVisitedURLsData(store, "."); vErr != nil {
+				if path, vErr := indexer.WriteVisitedURLsData(store, filepath.Join("data")); vErr != nil {
 					fmt.Printf("❌ visited_urls.data export error: %v\n", vErr)
 				} else {
 					fmt.Printf("✅ Visited URLs exported: %s\n", path)

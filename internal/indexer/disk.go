@@ -9,7 +9,8 @@ import (
 	"strings"
 )
 
-const defaultStorageDir = "storage"
+// Keep all persisted artifacts under ./data
+const defaultStorageDir = "data/storage"
 
 // FlushToDisk writes the in-memory inverted index to letter-partitioned .data files.
 //

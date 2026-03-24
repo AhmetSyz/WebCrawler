@@ -31,9 +31,35 @@ func Search(query string, index *indexer.InvertedIndex, docStore *indexer.Docume
 
 	docScores := make(map[string]uint32) // URL -> score
 
-	// Prefer in-memory index if available.
-	if index != nil {
-		for _, token := range tokens {
+	readFromDisk := func(token string) {
+		letter := diskFirstLetter(token)
+		fileName := filepath.Join("data", "storage", fmt.Sprintf("%s.data", letter))
+		f, err := os.Open(fileName)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			// token,url,origin_url,depth,count
+			parts := strings.SplitN(line, ",", 5)
+			if len(parts) != 5 {
+				continue
+			}
+			if unescapeCSV(parts[0]) != token {
+				continue
+			}
+			url := unescapeCSV(parts[1])
+			count := parseUint32(parts[4])
+			docScores[url] += count
+		}
+	}
+
+	for _, token := range tokens {
+		// 1) in-memory postings (if present)
+		if index != nil {
 			postings := index.GetPostings(token)
 			for docID, count := range postings {
 				if docStore == nil {
@@ -47,32 +73,9 @@ func Search(query string, index *indexer.InvertedIndex, docStore *indexer.Docume
 				docScores[meta.DocURL] += count
 			}
 		}
-	} else {
-		// Disk-based search: read only the letter-partitioned file for each token.
-		for _, token := range tokens {
-			letter := diskFirstLetter(token)
-			fileName := filepath.Join("storage", fmt.Sprintf("%s.data", letter))
-			f, err := os.Open(fileName)
-			if err != nil {
-				continue
-			}
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				line := scanner.Text()
-				// token,url,origin_url,depth,count
-				parts := strings.SplitN(line, ",", 5)
-				if len(parts) != 5 {
-					continue
-				}
-				if unescapeCSV(parts[0]) != token {
-					continue
-				}
-				url := unescapeCSV(parts[1])
-				count := parseUint32(parts[4])
-				docScores[url] += count
-			}
-			_ = f.Close()
-		}
+
+		// 2) disk shards (keeps search working after FlushAndClearToDisk)
+		readFromDisk(token)
 	}
 
 	if len(docScores) == 0 {
@@ -85,6 +88,9 @@ func Search(query string, index *indexer.InvertedIndex, docStore *indexer.Docume
 	}
 
 	sort.Slice(results, func(i, j int) bool {
+		if results[i].Score == results[j].Score {
+			return results[i].URL < results[j].URL
+		}
 		return results[i].Score > results[j].Score
 	})
 	return results
